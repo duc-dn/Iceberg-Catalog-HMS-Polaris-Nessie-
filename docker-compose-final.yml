@@ -1,0 +1,285 @@
+services:
+  postgres:
+    image: postgres:17.5
+    ports:
+      - "5433:5432"
+    # set shared memory limit when using docker-compose
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: POLARIS
+      # POSTGRES_INITDB_ARGS: "--encoding UTF8 --data-checksums"
+    # volumes:
+    #   # Bind local conf file to a convenient location in the container
+    #   - type: bind
+    #     source: ./postgres/postgresql.conf
+    #     target: /etc/postgresql/postgresql.conf
+    # command:
+    #   - "postgres"
+    #   - "-c"
+    #   - "config_file=/etc/postgresql/postgresql.conf"
+    healthcheck:
+      test: "pg_isready -U postgres"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+    networks:
+      - local-iceberg-lakehouse
+
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POLARIS_PERSISTENCE_TYPE=relational-jdbc
+      - QUARKUS_DATASOURCE_JDBC_URL=${QUARKUS_DATASOURCE_JDBC_URL}
+      - QUARKUS_DATASOURCE_USERNAME=${QUARKUS_DATASOURCE_USERNAME}
+      - QUARKUS_DATASOURCE_PASSWORD=${QUARKUS_DATASOURCE_PASSWORD}
+    command:
+      - "bootstrap"
+      - "--realm=default-realm"
+      - "--credential=default-realm,root,secret"
+    networks:
+      - local-iceberg-lakehouse
+
+  polaris:
+    image: apache/polaris:latest
+    platform: linux/amd64
+    ports:
+      # API port
+      - "8181:8181"
+      # Management port (metrics and health checks)
+      - "8182:8182"
+      # Optional, allows attaching a debugger to the Polaris JVM
+      - "5005:5005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      JAVA_DEBUG: true
+      JAVA_DEBUG_PORT: "*:5005"
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_RETRIES: 5
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_INITIAL_DELAY_IN_MS: 100
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_DURATION_IN_MS: 5000
+      QUARKUS_DATASOURCE_JDBC_URL: $QUARKUS_DATASOURCE_JDBC_URL
+      QUARKUS_DATASOURCE_USERNAME: $QUARKUS_DATASOURCE_USERNAME
+      QUARKUS_DATASOURCE_PASSWORD: $QUARKUS_DATASOURCE_PASSWORD
+      QUARKUS_OTEL_SDK_DISABLED: true
+      POLARIS_BOOTSTRAP_CREDENTIALS: default-realm,root,secret
+      polaris.realm-context.realms: default-realm
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: dummy-region
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ENDPOINT_URL_STS: http://minio:9000
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"FILE\",\"S3\",\"GCS\",\"AZURE\"]"
+      polaris.readiness.ignore-severe-issues: "true"
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:8182/q/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+    networks:
+      - local-iceberg-lakehouse
+
+  polaris-setup:
+    image: alpine/curl
+    depends_on:
+      polaris:
+        condition: service_healthy
+      minio-client:
+        condition: service_completed_successfully
+    environment:
+      - STORAGE_LOCATION=${STORAGE_LOCATION}
+      - AWS_ROLE_ARN=${AWS_ROLE_ARN}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+    volumes:
+      - ${ASSETS_PATH}/polaris/:/polaris
+    entrypoint: '/bin/sh -c "chmod +x /polaris/create-catalog.sh && /polaris/create-catalog.sh"'
+    networks:
+      - local-iceberg-lakehouse
+
+  spark-sql:
+    image: apache/spark:3.5.6-java17-python3
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    stdin_open: true
+    tty: true
+    ports:
+      - "4040-4045:4040-4045"
+    healthcheck:
+      test: "curl localhost:4040"
+      interval: 5s
+      retries: 15
+    command: [
+      /opt/spark/bin/spark-sql,
+      --packages, "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1,org.apache.iceberg:iceberg-aws-bundle:1.9.1,org.apache.iceberg:iceberg-gcp-bundle:1.9.1,org.apache.iceberg:iceberg-azure-bundle:1.9.1",
+      --conf, "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+      --conf, "spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog",
+      --conf, "spark.sql.catalog.polaris.type=rest",
+      --conf, "spark.sql.catalog.polaris.warehouse=quickstart_catalog",
+      --conf, "spark.sql.catalog.polaris.uri=http://polaris:8181/api/catalog",
+      --conf, "spark.sql.catalog.polaris.credential=root:s3cr3t",
+      --conf, "spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL",
+      --conf, "spark.sql.defaultCatalog=polaris",
+      --conf, "spark.sql.catalogImplementation=in-memory",
+      --conf, "spark.driver.extraJavaOptions=-Divy.cache.dir=/tmp -Divy.home=/tmp"
+    ]
+    networks:
+      - local-iceberg-lakehouse
+
+  trino:
+    image: trinodb/trino:latest
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    stdin_open: true
+    tty: true
+    ports:
+      - "8081:8080"
+    environment:
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    networks:
+      - local-iceberg-lakehouse
+  
+  mariadb:
+    image: 'mariadb:10.10.2'
+    hostname: mariadb
+    container_name: mariadb
+    ports:
+      - '3307:3306'
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+      MYSQL_DATABASE: metastore_db
+    networks:
+      - local-iceberg-lakehouse
+
+  hive-metastore:
+    image: 'bitsondatadev/hive-metastore:latest'
+    hostname: hive-metastore
+    container_name: hive-metastore
+    ports:
+      - '9083:9083' # Metastore Thrift
+    volumes:
+      - ./config/hms/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+      - hive-warehouse:/user/hive/warehouse
+    environment:
+      METASTORE_DB_HOSTNAME: mariadb
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: dummy-region
+    depends_on:
+      - mariadb
+      - minio
+    networks:
+      - local-iceberg-lakehouse
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: dummy-region
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      - ./minio_data:/data
+    command: ["server", "/data", "--console-address", ":9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      local-iceberg-lakehouse:
+        aliases:
+          - warehouse.minio
+
+  minio-client:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    volumes:
+      - /tmp:/tmp
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: dummy-region
+    entrypoint: >
+      /bin/sh -c "
+      until (mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      mc rm -r --force minio/warehouse || true;
+      mc mb minio/warehouse || true;
+      mc anonymous set public minio/warehouse || true;
+      echo 'MinIO setup completed';
+      exit 0
+      "
+    networks:
+      - local-iceberg-lakehouse
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: nessie
+    ports:
+      - "19120:19120"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # Database configuration - using shared PostgreSQL
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/NESSIE
+      QUARKUS_DATASOURCE_USERNAME: postgres
+      QUARKUS_DATASOURCE_PASSWORD: postgres
+      NESSIE_VERSION_STORE_TYPE: JDBC
+      
+      # Authentication (disable for testing)
+      NESSIE_SERVER_AUTHENTICATION_ENABLED: false
+      
+      # S3 configuration for MinIO
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: dummy-region
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
+      nessie.catalog.service.s3.path-style-access: true
+      nessie.catalog.service.s3.access-key.name: admin
+      nessie.catalog.service.s3.access-key.secret: password
+      nessie.catalog.service.s3.endpoint: http://minio:9000/
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - local-iceberg-lakehouse
+
+networks:
+  local-iceberg-lakehouse:
+    driver: bridge
+
+volumes:
+  hive-warehouse:
+  minio_data:

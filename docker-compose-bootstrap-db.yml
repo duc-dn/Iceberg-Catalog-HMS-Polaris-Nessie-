@@ -1,0 +1,17 @@
+services:
+  polaris-bootstrap:
+    # IMPORTANT: the image MUST contain the Postgres JDBC driver and EclipseLink dependencies, see README for instructions
+    image: apache/polaris-admin-tool:postgres-latest
+    environment:
+      polaris.persistence.type: eclipse-link
+      polaris.persistence.eclipselink.configuration-file: /deployments/config/eclipselink/persistence.xml
+    volumes:
+      - ${ASSETS_PATH}/eclipselink/:/deployments/config/eclipselink
+    command:
+      - "bootstrap"
+      - "--realm=POLARIS"
+      - "--credential=POLARIS,${CLIENT_ID},${CLIENT_SECRET}"
+  polaris:
+    depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
